@@ -124,7 +124,8 @@ const registerEditorEvents = (events: Events, editHistory: EditHistory, scene: S
     // camera.fov
 
     const setCameraFov = (fov: number) => {
-        if (fov !== scene.camera.fov) {
+        // Only update if value actually changed to prevent unnecessary updates
+        if (Math.abs(fov - scene.camera.fov) > 0.01) {
             scene.camera.fov = fov;
             events.fire('camera.fov', scene.camera.fov);
         }
@@ -136,6 +137,25 @@ const registerEditorEvents = (events: Events, editHistory: EditHistory, scene: S
 
     events.on('camera.setFov', (fov: number) => {
         setCameraFov(fov);
+    });
+
+    // camera.roll
+
+    const setCameraRoll = (roll: number) => {
+        const currentRoll = scene.camera.roll;
+        // Only update if value actually changed to prevent unnecessary updates
+        if (Math.abs(roll - currentRoll) > 0.01) {
+            scene.camera.setRoll(roll, 0);
+            events.fire('camera.roll', scene.camera.roll);
+        }
+    };
+
+    events.function('camera.roll', () => {
+        return scene.camera.roll;
+    });
+
+    events.on('camera.setRoll', (roll: number) => {
+        setCameraRoll(roll);
     });
 
     // camera.tonemapping
@@ -697,16 +717,27 @@ const registerEditorEvents = (events: Events, editHistory: EditHistory, scene: S
         const focalPoint = camera.focalPoint;
         return {
             position: { x: position.x, y: position.y, z: position.z },
-            target: { x: focalPoint.x, y: focalPoint.y, z: focalPoint.z }
+            target: { x: focalPoint.x, y: focalPoint.y, z: focalPoint.z },
+            roll: camera.roll,
+            fov: camera.fov
         };
     });
 
-    events.on('camera.setPose', (pose: { position: Vec3, target: Vec3 }, speed = 1) => {
+    events.on('camera.setPose', (pose: { position: Vec3, target: Vec3, roll?: number, fov?: number }, speed = 1) => {
         scene.camera.setPose(pose.position, pose.target, speed);
+        if (pose.roll !== undefined) {
+            // Use setCameraRoll to ensure UI updates during timeline playback
+            setCameraRoll(pose.roll);
+        }
+        if (pose.fov !== undefined) {
+            // Always update FOV and fire event during timeline playback
+            setCameraFov(pose.fov);
+        }
     });
 
     // hack: fire events to initialize UI
     events.fire('camera.fov', scene.camera.fov);
+    events.fire('camera.roll', scene.camera.roll);
     events.fire('camera.overlay', cameraOverlay);
     events.fire('view.bands', viewBands);
 

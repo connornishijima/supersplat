@@ -452,11 +452,15 @@ class ExportPopup extends Container {
                         const times = [];
                         const position = [];
                         const target = [];
+                        const roll = [];
+                        const fov = [];
                         for (let i = 0; i < orderedPoses.length; ++i) {
                             const p = orderedPoses[i];
                             times.push(p.frame);
                             position.push(p.position.x, p.position.y, p.position.z);
                             target.push(p.target.x, p.target.y, p.target.z);
+                            roll.push(p.roll ?? 0);
+                            fov.push(p.fov ?? 65);
                         }
 
                         animTracks.push({
@@ -469,7 +473,7 @@ class ExportPopup extends Container {
                             smoothness,
                             keyframes: {
                                 times,
-                                values: { position, target }
+                                values: { position, target, roll, fov }
                             }
                         });
 

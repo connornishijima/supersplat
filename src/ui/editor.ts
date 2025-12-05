@@ -7,6 +7,7 @@ import { BottomToolbar } from './bottom-toolbar';
 import { ColorPanel } from './color-panel';
 import { ExportPopup } from './export-popup';
 import { ImageSettingsDialog } from './image-settings-dialog';
+import { SequenceSettingsDialog } from './sequence-settings-dialog';
 import { localize, localizeInit } from './localization';
 import { Menu } from './menu';
 import { ModeToggle } from './mode-toggle';
@@ -176,6 +177,9 @@ class EditorUI {
         // image settings
         const imageSettingsDialog = new ImageSettingsDialog(events);
 
+        // sequence settings
+        const sequenceSettingsDialog = new SequenceSettingsDialog(events);
+
         // video settings
         const videoSettingsDialog = new VideoSettingsDialog(events);
 
@@ -183,6 +187,7 @@ class EditorUI {
         topContainer.append(exportPopup);
         topContainer.append(publishSettingsDialog);
         topContainer.append(imageSettingsDialog);
+        topContainer.append(sequenceSettingsDialog);
         topContainer.append(videoSettingsDialog);
 
         appContainer.append(editorContainer);
@@ -234,6 +239,43 @@ class EditorUI {
 
             if (imageSettings) {
                 await events.invoke('render.image', imageSettings);
+            }
+        });
+
+        events.function('show.sequenceSettingsDialog', async () => {
+            const sequenceSettings = await sequenceSettingsDialog.show();
+
+            if (sequenceSettings) {
+                try {
+                    let directoryHandle: FileSystemDirectoryHandle | null = null;
+
+                    if (window.showDirectoryPicker) {
+                        directoryHandle = await window.showDirectoryPicker({
+                            id: 'SuperSplatSequenceExport',
+                            mode: 'readwrite'
+                        });
+                    } else {
+                        await events.invoke('showPopup', {
+                            type: 'error',
+                            header: 'Directory picker not supported',
+                            message: 'Your browser does not support directory selection. Please use a modern browser that supports the File System Access API.'
+                        });
+                        return;
+                    }
+
+                    await events.invoke('render.sequence', sequenceSettings, directoryHandle);
+                } catch (error) {
+                    if (error instanceof DOMException && error.name === 'AbortError') {
+                        // user cancelled directory picker
+                        return;
+                    }
+
+                    await events.invoke('showPopup', {
+                        type: 'error',
+                        header: 'Failed to render sequence',
+                        message: `'${error.message ?? error}'`
+                    });
+                }
             }
         });
 

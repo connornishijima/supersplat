@@ -15,10 +15,12 @@ import {
     TONEMAP_LINEAR,
     TONEMAP_NEUTRAL,
     BoundingBox,
+    Color,
     Entity,
     Mat4,
     Picker,
     Plane,
+    Quat,
     Ray,
     RenderTarget,
     Texture,
@@ -54,6 +56,11 @@ const vecb = new Vec3();
 const va = new Vec3();
 const m = new Mat4();
 const v4 = new Vec4();
+const baseRotation = new Quat();
+const rollRotation = new Quat();
+const rollRotationLocal = new Quat();
+const finalRotation = new Quat();
+const baseRotationInv = new Quat();
 
 // modulo dealing with negative numbers
 const mod = (n: number, m: number) => ((n % m) + m) % m;
@@ -64,6 +71,8 @@ class Camera extends Element {
     focalPointTween = new TweenValue({ x: 0, y: 0.5, z: 0 });
     azimElevTween = new TweenValue({ azim: 30, elev: -15 });
     distanceTween = new TweenValue({ distance: 1 });
+    rollTween = new TweenValue({ roll: 0 });
+    onBgClrChange: (clr: Color) => void;
 
     minElev = -90;
     maxElev = 90;
@@ -191,6 +200,15 @@ class Camera extends Element {
         return this.distanceTween.target.distance;
     }
 
+    get roll() {
+        return this.rollTween.target.roll;
+    }
+
+    setRoll(roll: number, dampingFactorFactor: number = 1) {
+        const t = this.rollTween;
+        t.goto({ roll }, dampingFactorFactor * this.scene.config.controls.dampingFactor);
+    }
+
     setFocalPoint(point: Vec3, dampingFactorFactor: number = 1) {
         this.focalPointTween.goto(point, dampingFactorFactor * this.scene.config.controls.dampingFactor);
     }
@@ -302,6 +320,18 @@ class Camera extends Element {
 
         this.scene.events.on('scene.boundChanged', this.onBoundChanged, this);
 
+        // update camera clearColor when background color changes
+        this.onBgClrChange = (clr: Color) => {
+            this.entity.camera.clearColor.copy(clr);
+        };
+        this.scene.events.on('bgClr', this.onBgClrChange, this);
+
+        // initialize clearColor with current background color
+        const initialBgClr = this.scene.events.invoke('bgClr');
+        if (initialBgClr) {
+            this.entity.camera.clearColor.copy(initialBgClr);
+        }
+
         // prepare camera-specific uniforms
         this.updateCameraUniforms = () => {
             const device = this.scene.graphicsDevice;
@@ -372,6 +402,7 @@ class Camera extends Element {
         this.picker = null;
 
         this.scene.events.off('scene.boundChanged', this.onBoundChanged, this);
+        this.scene.events.off('bgClr', this.onBgClrChange, this);
     }
 
     // handle the scene's bound changing. the camera must be configured to render
@@ -462,9 +493,12 @@ class Camera extends Element {
         this.focalPointTween.update(deltaTime);
         this.azimElevTween.update(deltaTime);
         this.distanceTween.update(deltaTime);
+        this.rollTween.update(deltaTime);
 
         const azimElev = this.azimElevTween.value;
         const distance = this.distanceTween.value;
+        // Read roll value - should be immediate since we use dampingFactorFactor = 0
+        const roll = this.rollTween.value.roll;
 
         calcForwardVec(forwardVec, azimElev.azim, azimElev.elev);
         cameraPosition.copy(forwardVec);
@@ -472,7 +506,38 @@ class Camera extends Element {
         cameraPosition.add(this.focalPointTween.value);
 
         this.entity.setLocalPosition(cameraPosition);
-        this.entity.setLocalEulerAngles(azimElev.elev, azimElev.azim, 0);
+        
+        // Create base rotation from azimuth/elevation (pitch and yaw)
+        baseRotation.setFromEulerAngles(azimElev.elev, azimElev.azim, 0);
+        
+        // Apply roll rotation around the camera's forward axis using quaternions
+        // Get the forward vector directly from the base rotation quaternion
+        baseRotation.transformVector(Vec3.FORWARD, vec);
+        vec.normalize();
+        
+        // Create roll rotation quaternion around this forward axis
+        // Convert roll from degrees to radians
+        const rollRad = roll * math.DEG_TO_RAD;
+        
+        // Create quaternion manually using standard formula: q = [axis * sin(θ/2), cos(θ/2)]
+        // This ensures we have full control over the angle calculation
+        const halfAngle = rollRad * 0.5;
+        const sinHalf = Math.sin(halfAngle);
+        const cosHalf = Math.cos(halfAngle);
+        
+        rollRotation.set(
+            vec.x * sinHalf,
+            vec.y * sinHalf,
+            vec.z * sinHalf,
+            cosHalf
+        );
+        
+        // Combine rotations: we want baseRotation first, then rollRotation around forward axis
+        // In quaternion math: q1 * q2 applies q2 first, then q1
+        // So rollRotation * baseRotation applies baseRotation first, then rollRotation
+        finalRotation.mul2(rollRotation, baseRotation);
+        
+        this.entity.setLocalRotation(finalRotation);
 
         this.fitClippingPlanes(this.entity.getLocalPosition(), this.entity.forward);
 

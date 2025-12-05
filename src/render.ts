@@ -28,6 +28,17 @@ type VideoSettings = {
     codec: 'h264' | 'h265' | 'vp9' | 'av1';
 };
 
+type SequenceSettings = {
+    startFrame: number;
+    endFrame: number;
+    width: number;
+    height: number;
+    transparentBg: boolean;
+    showDebug: boolean;
+    format: 'png' | 'jpeg';
+    jpegQuality?: number;
+};
+
 const removeExtension = (filename: string) => {
     return filename.substring(0, filename.length - path.getExtension(filename).length);
 };
@@ -410,6 +421,381 @@ const registerRenderEvents = (scene: Scene, events: Events) => {
             events.fire('progressEnd');
         }
     });
+
+    events.function('render.sequence', async (sequenceSettings: SequenceSettings, directoryHandle: FileSystemDirectoryHandle) => {
+        events.fire('progressStart', localize('panel.render.render-sequence'));
+
+        try {
+            const { startFrame, endFrame, width, height, transparentBg, showDebug } = sequenceSettings;
+
+            // start rendering to offscreen buffer only
+            scene.camera.startOffscreenMode(width, height);
+            scene.camera.renderOverlays = showDebug;
+            scene.gizmoLayer.enabled = false;
+            if (!transparentBg) {
+                scene.camera.entity.camera.clearColor.copy(events.invoke('bgClr'));
+            }
+            scene.lockedRenderMode = true;
+
+            // cpu-side buffer to read pixels into
+            const data = new Uint8Array(width * height * 4);
+            const line = new Uint8Array(width * 4);
+
+            // Reuse canvas and buffers to avoid memory leaks (create once, reuse for all frames)
+            const reusableCanvas = sequenceSettings.format === 'jpeg' ? document.createElement('canvas') : null;
+            if (reusableCanvas) {
+                reusableCanvas.width = width;
+                reusableCanvas.height = height;
+            }
+            const reusableCtx = reusableCanvas ? reusableCanvas.getContext('2d', { willReadFrequently: false }) : null;
+            const reusableImageData = reusableCtx ? reusableCtx.createImageData(width, height) : null;
+            const reusableFlippedData = sequenceSettings.format === 'jpeg' ? new Uint8Array(width * height * 4) : null;
+
+            // get the list of visible splats
+            const splats = (scene.getElementsByType(ElementType.splat) as Splat[]).filter(splat => splat.visible);
+
+            // remember last camera position so we can skip sorting if the camera didn't move
+            const last_pos = new Vec3(0, 0, 0);
+            const last_forward = new Vec3(1, 0, 0);
+
+            // prepare the frame for rendering (same as video export)
+            const prepareFrame = async (frameTime: number) => {
+                events.fire('timeline.time', frameTime);
+
+                // manually update the camera so position and rotation are correct
+                scene.camera.onUpdate(0);
+
+                // if the camera didn't move, don't sort
+                const pos = scene.camera.entity.getPosition();
+                const forward = scene.camera.entity.forward;
+                if (last_pos.equals(pos) && last_forward.equals(forward)) {
+                    return;
+                }
+
+                // update remembered position
+                last_pos.copy(pos);
+                last_forward.copy(forward);
+
+                // wait for sorting to complete
+                await Promise.all(splats.map((splat) => {
+                    return new Promise<void>((resolve) => {
+                        const { instance } = splat.entity.gsplat;
+
+                        const handle = instance.sorter.on('updated', () => {
+                            handle.off();
+                            resolve();
+                        });
+
+                        instance.sort(scene.camera.entity);
+
+                        setTimeout(() => {
+                            resolve();
+                        }, 1000);
+                    });
+                }));
+            };
+
+            // capture frame data (returns buffer copy for async processing)
+            const captureFrame = async (frameNumber: number): Promise<Uint8Array> => {
+                const { renderTarget } = scene.camera.entity.camera;
+                const { workRenderTarget } = scene.camera;
+
+                scene.dataProcessor.copyRt(renderTarget, workRenderTarget);
+
+                // read the rendered frame
+                await workRenderTarget.colorBuffer.read(0, 0, width, height, { renderTarget: workRenderTarget, data });
+
+                // Create a copy of the buffer data to avoid detachment issues
+                const bufferCopy = new Uint8Array(data);
+
+                // the render buffer contains premultiplied alpha. so apply background color.
+                if (!transparentBg) {
+                    const bgClr = events.invoke('bgClr');
+                    const { r, g, b } = bgClr;
+                    for (let i = 0; i < bufferCopy.length; i += 4) {
+                        const a = 255 - bufferCopy[i + 3];
+                        bufferCopy[i + 0] += r * a;
+                        bufferCopy[i + 1] += g * a;
+                        bufferCopy[i + 2] += b * a;
+                        bufferCopy[i + 3] = 255;
+                    }
+                }
+
+                return bufferCopy;
+            };
+
+            // compress and save frame (can run in parallel)
+            const compressAndSaveFrame = async (frameNumber: number, bufferCopy: Uint8Array): Promise<void> => {
+                let arrayBuffer: ArrayBuffer;
+                const frameNumberStr = String(frameNumber).padStart(6, '0');
+
+                if (sequenceSettings.format === 'jpeg') {
+                    // Try WebCodecs ImageEncoder first (hardware-accelerated, much faster)
+                    // Check if ImageEncoder is available (Chrome 94+, Edge 94+)
+                    const ImageEncoder = (window as any).ImageEncoder;
+                    if (ImageEncoder) {
+                        let imageBitmap: ImageBitmap | null = null;
+                        try {
+                            // Reuse canvas and buffers to avoid memory leaks
+                            if (!reusableCanvas || !reusableCtx || !reusableImageData || !reusableFlippedData) {
+                                throw new Error('Reusable resources not available');
+                            }
+                            
+                            // Flip vertically for JPEG (canvas coordinate system)
+                            for (let y = 0; y < height; y++) {
+                                const srcRow = y * width * 4;
+                                const dstRow = (height - 1 - y) * width * 4;
+                                reusableFlippedData.set(bufferCopy.subarray(srcRow, srcRow + width * 4), dstRow);
+                            }
+                            
+                            reusableImageData.data.set(reusableFlippedData);
+                            reusableCtx.putImageData(reusableImageData, 0, 0);
+                            
+                            imageBitmap = await createImageBitmap(reusableCanvas);
+                            
+                            // Use WebCodecs ImageEncoder
+                            arrayBuffer = await new Promise<ArrayBuffer>((resolve, reject) => {
+                                const chunks: Uint8Array[] = [];
+                                let encoderClosed = false;
+                                
+                                const encoder = new ImageEncoder({
+                                    output: (chunk: any) => {
+                                        // Collect encoded chunks
+                                        const data = new Uint8Array(chunk.data);
+                                        chunks.push(data);
+                                        
+                                        // JPEG encoding typically completes in one chunk
+                                        // Resolve when we have the data
+                                        if (!encoderClosed) {
+                                            encoderClosed = true;
+                                            encoder.close();
+                                            imageBitmap.close();
+                                            
+                                            // Combine all chunks into single buffer
+                                            const totalLength = chunks.reduce((sum, arr) => sum + arr.length, 0);
+                                            const result = new Uint8Array(totalLength);
+                                            let offset = 0;
+                                            for (const chunkData of chunks) {
+                                                result.set(chunkData, offset);
+                                                offset += chunkData.length;
+                                            }
+                                            resolve(result.buffer);
+                                        }
+                                    },
+                                    error: (error: any) => {
+                                        if (!encoderClosed) {
+                                            encoderClosed = true;
+                                            encoder.close();
+                                            imageBitmap.close();
+                                        }
+                                        reject(error);
+                                    }
+                                });
+                                
+                                // Configure encoder for JPEG
+                                const quality = Math.round((sequenceSettings.jpegQuality ?? 0.92) * 100);
+                                try {
+                                    encoder.configure({
+                                        codec: 'jpeg',
+                                        quality: quality
+                                    });
+                                    
+                                    // Encode the frame
+                                    encoder.encode(imageBitmap);
+                                    
+                                    // Flush to ensure encoding completes
+                                    encoder.flush().catch((error: any) => {
+                                        if (!encoderClosed) {
+                                            encoderClosed = true;
+                                            encoder.close();
+                                            imageBitmap.close();
+                                            reject(error);
+                                        }
+                                    });
+                                } catch (error) {
+                                    if (!encoderClosed) {
+                                        encoderClosed = true;
+                                        encoder.close();
+                                        imageBitmap.close();
+                                    }
+                                    reject(error);
+                                }
+                            });
+                        } catch (error) {
+                            // Ensure ImageBitmap is closed even on error
+                            if (imageBitmap) {
+                                imageBitmap.close();
+                                imageBitmap = null;
+                            }
+                            // Fall back to canvas.toBlob if WebCodecs fails
+                            console.warn('WebCodecs ImageEncoder failed, falling back to canvas:', error);
+                            arrayBuffer = undefined; // Force fallback
+                        }
+                    }
+                    
+                    // Fallback to canvas.toBlob if WebCodecs not available or failed
+                    if (!arrayBuffer) {
+                        // Reuse canvas and buffers
+                        if (!reusableCanvas || !reusableCtx || !reusableImageData || !reusableFlippedData) {
+                            throw new Error('Reusable resources not available for fallback');
+                        }
+                        
+                        // Flip vertically for JPEG (canvas coordinate system)
+                        for (let y = 0; y < height; y++) {
+                            const srcRow = y * width * 4;
+                            const dstRow = (height - 1 - y) * width * 4;
+                            reusableFlippedData.set(bufferCopy.subarray(srcRow, srcRow + width * 4), dstRow);
+                        }
+                        
+                        // Copy flipped RGBA data to ImageData
+                        reusableImageData.data.set(reusableFlippedData);
+                        reusableCtx.putImageData(reusableImageData, 0, 0);
+
+                        // Encode as JPEG using canvas.toBlob (async but fast)
+                        arrayBuffer = await new Promise<ArrayBuffer>((resolve, reject) => {
+                            reusableCanvas!.toBlob((blob: Blob | null) => {
+                                if (blob) {
+                                    blob.arrayBuffer().then(resolve).catch(reject);
+                                } else {
+                                    reject(new Error('Failed to encode JPEG'));
+                                }
+                            }, 'image/jpeg', sequenceSettings.jpegQuality ?? 0.92);
+                        });
+                    }
+
+                    const filename = `frame_${frameNumberStr}.jpg`;
+                    if (directoryHandle) {
+                        try {
+                            const fileHandle = await directoryHandle.getFileHandle(filename, { create: true });
+                            const writable = await fileHandle.createWritable();
+                            await writable.write(arrayBuffer);
+                            await writable.close();
+                            console.log(`Exported: ${filename}`);
+                        } catch (error) {
+                            console.error(`Failed to save ${filename}:`, error);
+                            throw error;
+                        }
+                    }
+                } else {
+                    // PNG compression (slower but lossless)
+                    if (!compressor) {
+                        compressor = new PngCompressor();
+                    }
+
+                    arrayBuffer = await compressor.compress(
+                        new Uint32Array(bufferCopy.buffer),
+                        width,
+                        height
+                    );
+
+                    const filename = `frame_${frameNumberStr}.png`;
+                    if (directoryHandle) {
+                        const fileHandle = await directoryHandle.getFileHandle(filename, { create: true });
+                        const writable = await fileHandle.createWritable();
+                        await writable.write(arrayBuffer);
+                        await writable.close();
+                    }
+                }
+            };
+
+            const totalFrames = endFrame - startFrame + 1;
+            let completedFrames = 0;
+            const pendingSaves: Array<{ promise: Promise<void>, frame: number }> = [];
+            const maxParallel = 2; // Reduced to 2 to avoid file system bottlenecks
+            
+            // Periodic cleanup to prevent accumulation - force wait every 100 frames
+            let lastCleanupFrame = startFrame;
+
+            // Warmup: render the first frame twice to ensure camera properties are properly initialized
+            if (totalFrames > 0) {
+                await prepareFrame(startFrame);
+                scene.lockedRender = true;
+                await postRender();
+                // Now render it again for the actual capture
+            }
+
+            // Render each frame with parallel compression/saving
+            for (let frame = startFrame; frame <= endFrame; frame++) {
+                await prepareFrame(frame);
+
+                // render a frame
+                scene.lockedRender = true;
+
+                // wait for render to finish
+                await postRender();
+
+                // capture frame data
+                const bufferCopy = await captureFrame(frame);
+
+                // Start compression/saving in parallel (don't await immediately)
+                const savePromise = compressAndSaveFrame(frame, bufferCopy).then(() => {
+                    completedFrames++;
+                    events.fire('progressUpdate', {
+                        text: localize('panel.render.rendering', { ellipsis: true }),
+                        progress: 100 * completedFrames / totalFrames
+                    });
+                }).catch((error) => {
+                    completedFrames++;
+                    // Still update progress even on error
+                    events.fire('progressUpdate', {
+                        text: localize('panel.render.rendering', { ellipsis: true }),
+                        progress: 100 * completedFrames / totalFrames
+                    });
+                    throw error;
+                });
+                pendingSaves.push({ promise: savePromise, frame });
+
+                // Limit parallel operations - wait for one to complete if at limit
+                // This allows rendering to continue while compression happens
+                if (pendingSaves.length >= maxParallel) {
+                    // Wait for any promise to complete
+                    const completed = await Promise.race(pendingSaves.map(p => p.promise.then(() => p).catch(() => p)));
+                    // Remove the completed promise from the array
+                    const index = pendingSaves.findIndex(p => p === completed);
+                    if (index !== -1) {
+                        pendingSaves.splice(index, 1);
+                    } else {
+                        // Fallback: remove oldest if we can't find it
+                        pendingSaves.shift();
+                    }
+                    // Small yield to let file system operations complete and prevent throttling
+                    await new Promise(resolve => setTimeout(resolve, 1));
+                }
+                
+                // Periodic cleanup: every 100 frames, wait for all pending saves to complete
+                // This prevents accumulation and helps avoid browser file system throttling
+                if (frame - lastCleanupFrame >= 100) {
+                    if (pendingSaves.length > 0) {
+                        await Promise.all(pendingSaves.map(p => p.promise));
+                        pendingSaves.length = 0;
+                    }
+                    lastCleanupFrame = frame;
+                    // Longer pause to let file system catch up
+                    await new Promise(resolve => setTimeout(resolve, 10));
+                }
+            }
+
+            // Wait for all remaining saves to complete
+            await Promise.all(pendingSaves.map(p => p.promise));
+
+            return true;
+        } catch (error) {
+            await events.invoke('showPopup', {
+                type: 'error',
+                header: localize('render.failed'),
+                message: `'${error.message ?? error}'`
+            });
+        } finally {
+            scene.camera.endOffscreenMode();
+            scene.camera.renderOverlays = true;
+            scene.gizmoLayer.enabled = true;
+            scene.camera.entity.camera.clearColor.set(0, 0, 0, 0);
+            scene.lockedRenderMode = false;
+            scene.forceRender = true;
+
+            events.fire('progressEnd');
+        }
+    });
 };
 
-export { ImageSettings, VideoSettings, registerRenderEvents };
+export { ImageSettings, VideoSettings, SequenceSettings, registerRenderEvents };

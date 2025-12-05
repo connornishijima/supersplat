@@ -41,6 +41,8 @@ type AnimTrack = {
         values: {
             position: number[],
             target: number[],
+            roll?: number[],
+            fov?: number[],
         }
     }
 };

@@ -157,6 +157,27 @@ class ViewPanel extends Container {
         fovRow.append(fovLabel);
         fovRow.append(fovSlider);
 
+        // camera tilt
+        const tiltRow = new Container({
+            class: 'view-panel-row'
+        });
+
+        const tiltLabel = new Label({
+            text: 'Tilt',
+            class: 'view-panel-row-label'
+        });
+
+        const tiltSlider = new SliderInput({
+            class: 'view-panel-row-slider',
+            min: -180,
+            max: 180,
+            precision: 2,
+            value: 0
+        });
+
+        tiltRow.append(tiltLabel);
+        tiltRow.append(tiltSlider);
+
         // sh bands
         const shBandsRow = new Container({
             class: 'view-panel-row'
@@ -306,6 +327,7 @@ class ViewPanel extends Container {
         this.append(clrRow);
         this.append(tonemappingRow);
         this.append(fovRow);
+        this.append(tiltRow);
         this.append(shBandsRow);
         this.append(centersSizeRow);
         this.append(cameraFlySpeedRow);
@@ -432,13 +454,33 @@ class ViewPanel extends Container {
         });
 
         // camera fov
+        let suppressFovUpdate = false;
 
         events.on('camera.fov', (fov: number) => {
+            suppressFovUpdate = true;
             fovSlider.value = fov;
+            suppressFovUpdate = false;
         });
 
         fovSlider.on('change', (value: number) => {
-            events.fire('camera.setFov', value);
+            if (!suppressFovUpdate) {
+                events.fire('camera.setFov', value);
+            }
+        });
+
+        // camera tilt
+        let suppressTiltUpdate = false;
+
+        events.on('camera.roll', (roll: number) => {
+            suppressTiltUpdate = true;
+            tiltSlider.value = roll;
+            suppressTiltUpdate = false;
+        });
+
+        tiltSlider.on('change', (value: number) => {
+            if (!suppressTiltUpdate) {
+                events.fire('camera.setRoll', value);
+            }
         });
 
         // tonemapping

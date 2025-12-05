@@ -7,7 +7,9 @@ type Pose = {
     name: string,
     frame: number,
     position: Vec3,
-    target: Vec3
+    target: Vec3,
+    roll?: number,
+    fov?: number
 };
 
 const registerCameraPosesEvents = (events: Events) => {
@@ -31,6 +33,8 @@ const registerCameraPosesEvents = (events: Events) => {
             const p = orderedPoses[i];
             points.push(p.position.x, p.position.y, p.position.z);
             points.push(p.target.x, p.target.y, p.target.z);
+            points.push(p.roll ?? 0); // Add roll, default to 0 if not present
+            points.push(p.fov ?? 65); // Add fov, default to 65 if not present
         }
 
         if (orderedPoses.length > 1) {
@@ -49,7 +53,9 @@ const registerCameraPosesEvents = (events: Events) => {
                 // set camera pose
                 pose.position.set(result[0], result[1], result[2]);
                 pose.target.set(result[3], result[4], result[5]);
-                events.fire('camera.setPose', pose, 0);
+                const roll = result[6] ?? 0; // Get roll from spline result
+                const fov = result[7] ?? 65; // Get fov from spline result
+                events.fire('camera.setPose', { position: pose.position, target: pose.target, roll, fov }, 0);
             };
         } else {
             onTimelineChange = null;
@@ -130,7 +136,9 @@ const registerCameraPosesEvents = (events: Events) => {
             name: `camera_${poses.length}`,
             frame,
             position: pose.position,
-            target: pose.target
+            target: pose.target,
+            roll: pose.roll,
+            fov: pose.fov
         });
     });
 
@@ -178,7 +186,9 @@ const registerCameraPosesEvents = (events: Events) => {
                     name: pose.name,
                     frame: pose.frame,
                     position: pack3(pose.position),
-                    target: pack3(pose.target)
+                    target: pack3(pose.target),
+                    roll: pose.roll ?? 0,
+                    fov: pose.fov ?? 65
                 };
             })
         }];
@@ -197,9 +207,16 @@ const registerCameraPosesEvents = (events: Events) => {
                 name: docPose.name,
                 frame: docPose.frame ?? (index * fps),
                 position: new Vec3(docPose.position),
-                target: new Vec3(docPose.target)
+                target: new Vec3(docPose.target),
+                roll: docPose.roll ?? 0,
+                fov: docPose.fov ?? 65
             });
         });
+
+        // After loading poses and rebuilding spline, update camera to current frame
+        // This ensures roll and FOV are correctly set for the current timeline position
+        const currentFrame = events.invoke('timeline.frame');
+        events.fire('timeline.time', currentFrame);
     });
 };
 
