@@ -132,6 +132,7 @@
     "popup.render-sequence.frame-range-first": "First",
     "popup.render-sequence.frame-range-last": "Last",
     "popup.render-sequence.portrait": "Portrait Mode",
+    "popup.render-sequence.motion-blur-samples": "Motion Blur Samples",
     "popup.render-sequence.transparent-bg": "Transparent Background",
     "popup.render-sequence.show-debug": "Show Debug Overlays",
     "popup.shortcuts.title": "Keyboard Shortcuts",

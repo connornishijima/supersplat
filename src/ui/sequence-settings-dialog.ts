@@ -1,4 +1,4 @@
-import { BooleanInput, Button, Container, Element, Label, SelectInput, VectorInput } from '@playcanvas/pcui';
+import { BooleanInput, Button, Container, Element, Label, NumericInput, SelectInput, VectorInput } from '@playcanvas/pcui';
 
 import { Events } from '../events';
 import { SequenceSettings } from '../render';
@@ -106,6 +106,20 @@ class SequenceSettingsDialog extends Container {
         portraitRow.append(portraitLabel);
         portraitRow.append(portraitBoolean);
 
+        // motion blur samples
+
+        const motionBlurLabel = new Label({ class: 'label', text: localize('popup.render-sequence.motion-blur-samples') });
+        const motionBlurInput = new NumericInput({
+            class: 'numeric-input',
+            min: 1,
+            max: 100,
+            precision: 0,
+            value: 1
+        });
+        const motionBlurRow = new Container({ class: 'row' });
+        motionBlurRow.append(motionBlurLabel);
+        motionBlurRow.append(motionBlurInput);
+
         // transparent background
 
         const transparentBgLabel = new Label({ class: 'label', text: localize('popup.render-sequence.transparent-bg') });
@@ -129,6 +143,7 @@ class SequenceSettingsDialog extends Container {
         content.append(formatRow);
         content.append(frameRangeRow);
         content.append(portraitRow);
+        content.append(motionBlurRow);
         content.append(transparentBgRow);
         content.append(showDebugRow);
 
@@ -215,6 +230,8 @@ class SequenceSettingsDialog extends Container {
 
                     const frameRange = frameRangeInput.value as number[];
 
+                    const motionBlurSamples = Math.max(1, Math.floor(Number(motionBlurInput.value ?? 1)));
+
                     const sequenceSettings = {
                         startFrame: frameRange[0],
                         endFrame: frameRange[1],
@@ -223,7 +240,8 @@ class SequenceSettingsDialog extends Container {
                         transparentBg: transparentBgBoolean.value,
                         showDebug: showDebugBoolean.value,
                         format: formatSelect.value as 'png' | 'jpeg',
-                        jpegQuality: 0.92
+                        jpegQuality: 0.92,
+                        motionBlurSamples
                     };
 
                     resolve(sequenceSettings);

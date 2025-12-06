@@ -37,6 +37,7 @@ type SequenceSettings = {
     showDebug: boolean;
     format: 'png' | 'jpeg';
     jpegQuality?: number;
+    motionBlurSamples?: number;
 };
 
 const removeExtension = (filename: string) => {
@@ -427,6 +428,8 @@ const registerRenderEvents = (scene: Scene, events: Events) => {
 
         try {
             const { startFrame, endFrame, width, height, transparentBg, showDebug } = sequenceSettings;
+            const motionBlurSamples = Math.max(1, Math.floor(Number(sequenceSettings.motionBlurSamples ?? 1)));
+            const hasMotionBlur = motionBlurSamples > 1;
 
             // start rendering to offscreen buffer only
             scene.camera.startOffscreenMode(width, height);
@@ -439,7 +442,6 @@ const registerRenderEvents = (scene: Scene, events: Events) => {
 
             // cpu-side buffer to read pixels into
             const data = new Uint8Array(width * height * 4);
-            const line = new Uint8Array(width * 4);
 
             // Reuse canvas and buffers to avoid memory leaks (create once, reuse for all frames)
             const reusableCanvas = sequenceSettings.format === 'jpeg' ? document.createElement('canvas') : null;
@@ -459,7 +461,7 @@ const registerRenderEvents = (scene: Scene, events: Events) => {
             const last_forward = new Vec3(1, 0, 0);
 
             // prepare the frame for rendering (same as video export)
-            const prepareFrame = async (frameTime: number) => {
+            const prepareFrame = async (frameTime: number, skipSort: boolean = false) => {
                 events.fire('timeline.time', frameTime);
 
                 // manually update the camera so position and rotation are correct
@@ -475,6 +477,10 @@ const registerRenderEvents = (scene: Scene, events: Events) => {
                 // update remembered position
                 last_pos.copy(pos);
                 last_forward.copy(forward);
+
+                if (skipSort) {
+                    return;
+                }
 
                 // wait for sorting to complete
                 await Promise.all(splats.map((splat) => {
@@ -496,7 +502,7 @@ const registerRenderEvents = (scene: Scene, events: Events) => {
             };
 
             // capture frame data (returns buffer copy for async processing)
-            const captureFrame = async (frameNumber: number): Promise<Uint8Array> => {
+            const captureFrame = async (frameNumber: number, targetBuffer?: Uint8Array): Promise<Uint8Array> => {
                 const { renderTarget } = scene.camera.entity.camera;
                 const { workRenderTarget } = scene.camera;
 
@@ -505,8 +511,9 @@ const registerRenderEvents = (scene: Scene, events: Events) => {
                 // read the rendered frame
                 await workRenderTarget.colorBuffer.read(0, 0, width, height, { renderTarget: workRenderTarget, data });
 
-                // Create a copy of the buffer data to avoid detachment issues
-                const bufferCopy = new Uint8Array(data);
+                // Copy buffer so downstream async work is safe; reuse provided buffer when possible
+                const bufferCopy = (targetBuffer && targetBuffer.length === data.length) ? targetBuffer : new Uint8Array(data.length);
+                bufferCopy.set(data);
 
                 // the render buffer contains premultiplied alpha. so apply background color.
                 if (!transparentBg) {
@@ -698,85 +705,100 @@ const registerRenderEvents = (scene: Scene, events: Events) => {
                 }
             };
 
-            const totalFrames = endFrame - startFrame + 1;
+            const totalSourceFrames = endFrame - startFrame + 1;
+            const totalExportFrames = Math.ceil(totalSourceFrames / motionBlurSamples);
             let completedFrames = 0;
-            const pendingSaves: Array<{ promise: Promise<void>, frame: number }> = [];
-            const maxParallel = 2; // Reduced to 2 to avoid file system bottlenecks
-            
-            // Periodic cleanup to prevent accumulation - force wait every 100 frames
-            let lastCleanupFrame = startFrame;
+
+            const updateProgress = (framesDone: number, framesTotal: number, sampleIndex: number, sampleTotal: number) => {
+                events.fire('progressUpdate', {
+                    text: `${localize('panel.render.rendering', { ellipsis: true })} (${framesDone+1} / ${framesTotal+1})\nSample (${sampleIndex+1} / ${sampleTotal+1})`,
+                    progress: framesTotal > 0 ? (100 * framesDone / framesTotal) : 0
+                });
+            };
+
+            // Accumulation buffer for motion blur (only used if motionBlurSamples > 1)
+            const motionBlurAccumulator = hasMotionBlur ? new Float32Array(width * height * 4) : null;
+            // Reusable buffers to minimize allocations
+            const sampleBuffer = new Uint8Array(width * height * 4);
+            const averagedBuffer = hasMotionBlur ? new Uint8Array(width * height * 4) : null;
 
             // Warmup: render the first frame twice to ensure camera properties are properly initialized
-            if (totalFrames > 0) {
+            if (totalSourceFrames > 0) {
                 await prepareFrame(startFrame);
                 scene.lockedRender = true;
                 await postRender();
                 // Now render it again for the actual capture
             }
 
-            // Render each frame with parallel compression/saving
-            for (let frame = startFrame; frame <= endFrame; frame++) {
-                await prepareFrame(frame);
-
-                // render a frame
-                scene.lockedRender = true;
-
-                // wait for render to finish
-                await postRender();
-
-                // capture frame data
-                const bufferCopy = await captureFrame(frame);
-
-                // Start compression/saving in parallel (don't await immediately)
-                const savePromise = compressAndSaveFrame(frame, bufferCopy).then(() => {
-                    completedFrames++;
-                    events.fire('progressUpdate', {
-                        text: localize('panel.render.rendering', { ellipsis: true }),
-                        progress: 100 * completedFrames / totalFrames
-                    });
-                }).catch((error) => {
-                    completedFrames++;
-                    // Still update progress even on error
-                    events.fire('progressUpdate', {
-                        text: localize('panel.render.rendering', { ellipsis: true }),
-                        progress: 100 * completedFrames / totalFrames
-                    });
-                    throw error;
-                });
-                pendingSaves.push({ promise: savePromise, frame });
-
-                // Limit parallel operations - wait for one to complete if at limit
-                // This allows rendering to continue while compression happens
-                if (pendingSaves.length >= maxParallel) {
-                    // Wait for any promise to complete
-                    const completed = await Promise.race(pendingSaves.map(p => p.promise.then(() => p).catch(() => p)));
-                    // Remove the completed promise from the array
-                    const index = pendingSaves.findIndex(p => p === completed);
-                    if (index !== -1) {
-                        pendingSaves.splice(index, 1);
-                    } else {
-                        // Fallback: remove oldest if we can't find it
-                        pendingSaves.shift();
+            // Render frames with motion blur support
+            let exportFrameIndex = 0;
+            for (let sourceFrame = startFrame; sourceFrame <= endFrame; sourceFrame += motionBlurSamples) {
+                // Accumulate N frames for motion blur
+                if (hasMotionBlur && motionBlurAccumulator) {
+                    // Reset accumulator
+                    motionBlurAccumulator.fill(0);
+                    
+                    // Accumulate N consecutive frames, but skip the first as a warmup to avoid ghosting
+                    const sampleEnd = Math.min(sourceFrame + motionBlurSamples - 1, endFrame);
+                    const groupSamples = sampleEnd - sourceFrame + 1;
+                    const accumulateStart = groupSamples > 1 ? sourceFrame + 1 : sourceFrame;
+                    const actualSamples = groupSamples > 1 ? groupSamples - 1 : 1;
+                    
+                    // Warmup sample (not accumulated)
+                    await prepareFrame(sourceFrame, false);
+                    scene.lockedRender = true;
+                    scene.forceRender = true;
+                    await postRender();
+                    await captureFrame(sourceFrame, sampleBuffer); // discard
+                    updateProgress(completedFrames, totalExportFrames, 0, actualSamples);
+                    
+                    let sampleIdx = 0;
+                    for (let sampleFrame = accumulateStart; sampleFrame <= sampleEnd; sampleFrame++) {
+                        // Sort only on the first accumulated sample; reuse order for the rest
+                        const skipSort = sampleFrame !== accumulateStart;
+                        await prepareFrame(sampleFrame, skipSort);
+                        scene.lockedRender = true;
+                        scene.forceRender = true; // ensure a fresh render for each sample
+                        await postRender();
+                        
+                        const bufferCopy = await captureFrame(sampleFrame, sampleBuffer);
+                        
+                        // Accumulate into motion blur buffer (as floats for precision)
+                        for (let i = 0; i < bufferCopy.length; i++) {
+                            motionBlurAccumulator[i] += bufferCopy[i];
+                        }
+                        sampleIdx++;
+                        updateProgress(completedFrames, totalExportFrames, sampleIdx, actualSamples);
                     }
-                    // Small yield to let file system operations complete and prevent throttling
-                    await new Promise(resolve => setTimeout(resolve, 1));
-                }
-                
-                // Periodic cleanup: every 100 frames, wait for all pending saves to complete
-                // This prevents accumulation and helps avoid browser file system throttling
-                if (frame - lastCleanupFrame >= 100) {
-                    if (pendingSaves.length > 0) {
-                        await Promise.all(pendingSaves.map(p => p.promise));
-                        pendingSaves.length = 0;
+                    
+                    // Average by dividing by number of samples
+                    if (!averagedBuffer) {
+                        throw new Error('Averaged buffer not available');
                     }
-                    lastCleanupFrame = frame;
-                    // Longer pause to let file system catch up
-                    await new Promise(resolve => setTimeout(resolve, 10));
+                    for (let i = 0; i < motionBlurAccumulator.length; i++) {
+                        averagedBuffer[i] = Math.round(motionBlurAccumulator[i] / actualSamples);
+                    }
+                    
+                    // Export the averaged frame sequentially (one at a time)
+                    const exportFrameNumber = startFrame + exportFrameIndex;
+                    await compressAndSaveFrame(exportFrameNumber, averagedBuffer);
+                    completedFrames++;
+                    updateProgress(completedFrames, totalExportFrames, actualSamples, actualSamples);
+                    exportFrameIndex++;
+                } else {
+                    // No motion blur - export each frame normally
+                    await prepareFrame(sourceFrame);
+                    scene.lockedRender = true;
+                    scene.forceRender = true; // force render so motion is captured per frame
+                    await postRender();
+                    
+                    const bufferCopy = await captureFrame(sourceFrame, sampleBuffer);
+                    
+                    await compressAndSaveFrame(sourceFrame, bufferCopy);
+                    completedFrames++;
+                    updateProgress(completedFrames, totalExportFrames, 1, 1);
                 }
             }
-
-            // Wait for all remaining saves to complete
-            await Promise.all(pendingSaves.map(p => p.promise));
 
             return true;
         } catch (error) {
